@@ -10,7 +10,7 @@ and POSTs changed days to the log-habit edge function:
 
 Config lives in settings/habitdesu.lua:
     return { token = "hd_live_...", habit = "read", window = 21 }       -- habitdesu.com
-    return { token = "hf_...",      channel = "read", window = 21 }     -- Habits First (iOS)
+    return { token = "hf_...",      channel = "koreader", window = 21 } -- Habits First (iOS)
 A Habits First token (More integrations → Shortcuts → Other devices)
 posts {channel, day, value, meta} to the hf-report inbox instead.
 
@@ -34,7 +34,8 @@ local _ = require("gettext")
 --   hd_live_...  habitdesu.com (log-habit webhook, habit by name)
 --   hf_...       Habits First iOS (hf-report inbox, channel by name)
 local ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/functions/v1/log-habit"
-local HF_ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/functions/v1/hf-report"
+local HF_ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/rest/v1/hf_reports"
+local HF_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhxa2drbGZjeHJsbWpnZ2hnemppIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4Njg3NjcsImV4cCI6MjA5ODQ0NDc2N30.WyK2OLUxYTjsq5KBMClpn8SQDWz-g0di_k7NpJ-n6QU"
 
 local function isHabitsFirst(token)
     return token:sub(1, 3) == "hf_"
@@ -121,7 +122,8 @@ end
 
 function HabitDesu:_sync(manual)
     local token = self.settings:readSetting("token") or ""
-    local habit = self.settings:readSetting("channel") or self.settings:readSetting("habit") or "read"
+    local habit = self.settings:readSetting("channel") or self.settings:readSetting("habit")
+        or (isHabitsFirst(token) and "koreader" or "read")
     local window = self.settings:readSetting("window") or 21
     if token == "" then
         if manual then
@@ -237,8 +239,8 @@ function HabitDesu:post(token, habit, day, info)
     if isHabitsFirst(token) then
         url = HF_ENDPOINT
         body = string.format(
-            '{"channel":"%s","day":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}',
-            jsonEscape(habit), day, info.total, table.concat(books, ","))
+            '[{"token":"%s","channel":"%s","day":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]',
+            token, jsonEscape(habit), day, info.total, table.concat(books, ","))
     else
         url = ENDPOINT
         body = string.format(
@@ -253,7 +255,14 @@ function HabitDesu:post(token, habit, day, info)
         local _res, c = requester.request{
             url = url,
             method = "POST",
-            headers = {
+            headers = isHabitsFirst(token) and {
+                ["Content-Type"] = "application/json",
+                ["Content-Length"] = tostring(#body),
+                ["apikey"] = HF_ANON,
+                ["Authorization"] = "Bearer " .. HF_ANON,
+                ["x-hf-token"] = token,
+                ["Prefer"] = "resolution=merge-duplicates",
+            } or {
                 ["Content-Type"] = "application/json",
                 ["Content-Length"] = tostring(#body),
                 ["Authorization"] = "Bearer " .. token,
