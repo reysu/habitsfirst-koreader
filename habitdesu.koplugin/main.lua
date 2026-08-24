@@ -9,7 +9,10 @@ and POSTs changed days to the log-habit edge function:
     {"date":"YYYY-MM-DD","entries":[{"name":"<habit>","value":<pages>}]}
 
 Config lives in settings/habitdesu.lua:
-    return { token = "hd_live_...", habit = "read", window = 21 }
+    return { token = "hd_live_...", habit = "read", window = 21 }       -- habitdesu.com
+    return { token = "hf_...",      channel = "read", window = 21 }     -- Habits First (iOS)
+A Habits First token (More integrations → Shortcuts → Other devices)
+posts {channel, day, value, meta} to the hf-report inbox instead.
 
 Sync triggers: KOReader start (~15s), closing a book (+5s), suspend,
 network reconnect, and Tools → habitsです sync → Sync now.
@@ -27,7 +30,15 @@ local logger = require("logger")
 local ltn12 = require("ltn12")
 local _ = require("gettext")
 
+-- Two backends, chosen by the token prefix:
+--   hd_live_...  habitdesu.com (log-habit webhook, habit by name)
+--   hf_...       Habits First iOS (hf-report inbox, channel by name)
 local ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/functions/v1/log-habit"
+local HF_ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/functions/v1/hf-report"
+
+local function isHabitsFirst(token)
+    return token:sub(1, 3) == "hf_"
+end
 
 -- module-level so the FileManager and Reader instances share one rate limit
 local last_auto_sync = 0
@@ -110,7 +121,7 @@ end
 
 function HabitDesu:_sync(manual)
     local token = self.settings:readSetting("token") or ""
-    local habit = self.settings:readSetting("habit") or "read"
+    local habit = self.settings:readSetting("channel") or self.settings:readSetting("habit") or "read"
     local window = self.settings:readSetting("window") or 21
     if token == "" then
         if manual then
@@ -222,16 +233,25 @@ function HabitDesu:post(token, habit, day, info)
             '{"title":"%s","pages":%d,"minutes":%d}',
             jsonEscape(b.title), b.pages, b.minutes))
     end
-    local body = string.format(
-        '{"date":"%s","entries":[{"name":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]}',
-        day, jsonEscape(habit), info.total, table.concat(books, ","))
+    local body, url
+    if isHabitsFirst(token) then
+        url = HF_ENDPOINT
+        body = string.format(
+            '{"channel":"%s","day":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}',
+            jsonEscape(habit), day, info.total, table.concat(books, ","))
+    else
+        url = ENDPOINT
+        body = string.format(
+            '{"date":"%s","entries":[{"name":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]}',
+            day, jsonEscape(habit), info.total, table.concat(books, ","))
+    end
     local sink = {}
     local requester = require("ssl.https")
     local has_su, socketutil = pcall(require, "socketutil")
     if has_su then socketutil:set_timeout(10, 30) end
     local ok, code = pcall(function()
         local _res, c = requester.request{
-            url = ENDPOINT,
+            url = url,
             method = "POST",
             headers = {
                 ["Content-Type"] = "application/json",
