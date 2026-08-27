@@ -1,21 +1,20 @@
 --[[
-habitsです sync — pushes daily pages read to habitdesu.
+Habits First sync — pushes daily pages read to Habits First.
 
-Reads KOReader's own statistics.sqlite3 (distinct pages turned per local day)
-and POSTs changed days to the log-habit edge function:
+Reads KOReader's own statistics.sqlite3 (distinct pages turned per local
+day) and upserts changed days into the Habits First inbox:
 
-    POST <endpoint>
-    Authorization: Bearer hd_live_...
-    {"date":"YYYY-MM-DD","entries":[{"name":"<habit>","value":<pages>}]}
+    POST /rest/v1/hf_reports   (x-hf-token: hf_...)
+    [{"token":"hf_...","channel":"koreader","day":"YYYY-MM-DD","value":N,
+      "meta":{"source":"koreader","books":[{title,pages,minutes},...]}}]
 
-Config lives in settings/habitdesu.lua:
-    return { token = "hd_live_...", habit = "read", window = 21 }       -- habitdesu.com
-    return { token = "hf_...",      channel = "koreader", window = 21 } -- Habits First (iOS)
-A Habits First token (More integrations → Shortcuts → Other devices)
-posts {channel, day, value, meta} to the hf-report inbox instead.
+Config lives in settings/habitsfirst.lua:
+    return { token = "hf_...", channel = "koreader", window = 21 }
+The token comes from the app: More integrations → KOReader → Plugin →
+Connect. (A legacy settings/habitdesu.lua with an hf_ token still works.)
 
 Sync triggers: KOReader start (~15s), closing a book (+5s), suspend,
-network reconnect, and Tools → habitsです sync → Sync now.
+network reconnect, and Tools → Habits First sync → Sync now.
 All work is wrapped in pcall — a failure can never interrupt reading.
 ]]
 
@@ -30,27 +29,27 @@ local logger = require("logger")
 local ltn12 = require("ltn12")
 local _ = require("gettext")
 
--- Two backends, chosen by the token prefix:
---   hd_live_...  habitdesu.com (log-habit webhook, habit by name)
---   hf_...       Habits First iOS (hf-report inbox, channel by name)
-local ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/functions/v1/log-habit"
 local HF_ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/rest/v1/hf_reports"
 local HF_ANON = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inhxa2drbGZjeHJsbWpnZ2hnemppIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODI4Njg3NjcsImV4cCI6MjA5ODQ0NDc2N30.WyK2OLUxYTjsq5KBMClpn8SQDWz-g0di_k7NpJ-n6QU"
-
-local function isHabitsFirst(token)
-    return token:sub(1, 3) == "hf_"
-end
 
 -- module-level so the FileManager and Reader instances share one rate limit
 local last_auto_sync = 0
 
-local HabitDesu = WidgetContainer:extend{
-    name = "habitdesu",
+local HabitsFirst = WidgetContainer:extend{
+    name = "habitsfirst",
     is_doc_only = false,
 }
 
-function HabitDesu:init()
-    self.settings = LuaSettings:open(DataStorage:getSettingsDir() .. "/habitdesu.lua")
+function HabitsFirst:init()
+    local dir = DataStorage:getSettingsDir()
+    self.settings = LuaSettings:open(dir .. "/habitsfirst.lua")
+    if (self.settings:readSetting("token") or "") == "" then
+        -- Legacy install: the settings file kept its old name.
+        local legacy = LuaSettings:open(dir .. "/habitdesu.lua")
+        if (legacy:readSetting("token") or ""):sub(1, 3) == "hf_" then
+            self.settings = legacy
+        end
+    end
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
     end
@@ -59,9 +58,9 @@ function HabitDesu:init()
     end)
 end
 
-function HabitDesu:addToMainMenu(menu_items)
-    menu_items.habitdesu = {
-        text = _("habitsです sync"),
+function HabitsFirst:addToMainMenu(menu_items)
+    menu_items.habitsfirst = {
+        text = _("Habits First sync"),
         sorting_hint = "tools",
         sub_item_table = {
             {
@@ -73,12 +72,12 @@ function HabitDesu:addToMainMenu(menu_items)
             {
                 text_func = function()
                     local token = self.settings:readSetting("token") or ""
-                    local habit = self.settings:readSetting("habit") or "read"
+                    local channel = self.settings:readSetting("channel") or "koreader"
                     local last = self.settings:readSetting("last_result") or _("never")
                     if token == "" then
                         return _("Status: no token configured")
                     end
-                    return string.format("%s → %s", habit, last)
+                    return string.format("%s → %s", channel, last)
                 end,
                 keep_menu_open = true,
                 callback = function() end,
@@ -87,48 +86,47 @@ function HabitDesu:addToMainMenu(menu_items)
     }
 end
 
-function HabitDesu:onCloseDocument()
+function HabitsFirst:onCloseDocument()
     UIManager:scheduleIn(5, function()
         self:autoSync()
     end)
 end
 
-function HabitDesu:onSuspend()
+function HabitsFirst:onSuspend()
     self:autoSync()
 end
 
-function HabitDesu:onNetworkConnected()
+function HabitsFirst:onNetworkConnected()
     UIManager:scheduleIn(5, function()
         self:autoSync()
     end)
 end
 
-function HabitDesu:autoSync()
+function HabitsFirst:autoSync()
     if os.time() - last_auto_sync < 300 then return end
     self:sync(false)
 end
 
-function HabitDesu:sync(manual)
+function HabitsFirst:sync(manual)
     local ok, err = pcall(function()
         self:_sync(manual)
     end)
     if not ok then
-        logger.warn("habitdesu: sync failed", err)
+        logger.warn("habitsfirst: sync failed", err)
         if manual then
-            UIManager:show(InfoMessage:new{ text = _("habitsです sync failed: ") .. tostring(err) })
+            UIManager:show(InfoMessage:new{ text = _("Habits First sync failed: ") .. tostring(err) })
         end
     end
 end
 
-function HabitDesu:_sync(manual)
+function HabitsFirst:_sync(manual)
     local token = self.settings:readSetting("token") or ""
-    local habit = self.settings:readSetting("channel") or self.settings:readSetting("habit")
-        or (isHabitsFirst(token) and "koreader" or "read")
+    local channel = self.settings:readSetting("channel") or "koreader"
     local window = self.settings:readSetting("window") or 21
-    if token == "" then
+    if token:sub(1, 3) ~= "hf_" then
         if manual then
             UIManager:show(InfoMessage:new{
-                text = _("No habitsです token configured (settings/habitdesu.lua)."),
+                text = _("No Habits First token configured (settings/habitsfirst.lua — get one in the app under More integrations → KOReader)."),
             })
         end
         return
@@ -154,7 +152,7 @@ function HabitDesu:_sync(manual)
     local sent, failed = 0, 0
     for day, info in pairs(daily) do
         if synced[day] ~= info.total then
-            if self:post(token, habit, day, info) then
+            if self:post(token, channel, day, info) then
                 synced[day] = info.total
                 sent = sent + 1
             else
@@ -180,15 +178,15 @@ function HabitDesu:_sync(manual)
     self.settings:saveSetting("synced", synced)
     self.settings:saveSetting("last_result", os.date("%m-%d %H:%M ") .. result)
     self.settings:flush()
-    logger.info("habitdesu:", result)
+    logger.info("habitsfirst:", result)
     if manual then
-        UIManager:show(InfoMessage:new{ text = _("habitsです: ") .. result })
+        UIManager:show(InfoMessage:new{ text = _("Habits First: ") .. result })
     end
 end
 
 -- per-day, per-book pages for the last `days` days:
 -- { ["2026-07-03"] = { total = 38, books = { {title=..., pages=..., minutes=...}, ... } } }
-function HabitDesu:getDailyPages(days)
+function HabitsFirst:getDailyPages(days)
     local db_path = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
     local ok, conn = pcall(SQ3.open, db_path, "ro")
     if not ok or not conn then return nil end
@@ -226,46 +224,32 @@ local function jsonEscape(s)
     return s:gsub('[\\"]', '\\%0'):gsub("[%c]", " ")
 end
 
-function HabitDesu:post(token, habit, day, info)
-    -- meta mirrors the whoop/apple_health pattern so clients can render
-    -- "Book title — 35 pages" when a day is tapped
+function HabitsFirst:post(token, channel, day, info)
+    -- meta lets clients render "Book title — 35 pages" when a day is tapped
     local books = {}
     for _, b in ipairs(info.books) do
         table.insert(books, string.format(
             '{"title":"%s","pages":%d,"minutes":%d}',
             jsonEscape(b.title), b.pages, b.minutes))
     end
-    local body, url
-    if isHabitsFirst(token) then
-        url = HF_ENDPOINT
-        body = string.format(
-            '[{"token":"%s","channel":"%s","day":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]',
-            token, jsonEscape(habit), day, info.total, table.concat(books, ","))
-    else
-        url = ENDPOINT
-        body = string.format(
-            '{"date":"%s","entries":[{"name":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]}',
-            day, jsonEscape(habit), info.total, table.concat(books, ","))
-    end
+    local body = string.format(
+        '[{"token":"%s","channel":"%s","day":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]',
+        token, jsonEscape(channel), day, info.total, table.concat(books, ","))
     local sink = {}
     local requester = require("ssl.https")
     local has_su, socketutil = pcall(require, "socketutil")
     if has_su then socketutil:set_timeout(10, 30) end
     local ok, code = pcall(function()
         local _res, c = requester.request{
-            url = url,
+            url = HF_ENDPOINT,
             method = "POST",
-            headers = isHabitsFirst(token) and {
+            headers = {
                 ["Content-Type"] = "application/json",
                 ["Content-Length"] = tostring(#body),
                 ["apikey"] = HF_ANON,
                 ["Authorization"] = "Bearer " .. HF_ANON,
                 ["x-hf-token"] = token,
                 ["Prefer"] = "resolution=merge-duplicates",
-            } or {
-                ["Content-Type"] = "application/json",
-                ["Content-Length"] = tostring(#body),
-                ["Authorization"] = "Bearer " .. token,
             },
             source = ltn12.source.string(body),
             sink = ltn12.sink.table(sink),
@@ -274,14 +258,14 @@ function HabitDesu:post(token, habit, day, info)
     end)
     if has_su then socketutil:reset_timeout() end
     if not ok then
-        logger.warn("habitdesu: request error", code)
+        logger.warn("habitsfirst: request error", code)
         return false
     end
     if code == 200 or code == 201 then
         return true
     end
-    logger.warn("habitdesu: HTTP", code, table.concat(sink))
+    logger.warn("habitsfirst: HTTP", code, table.concat(sink))
     return false
 end
 
-return HabitDesu
+return HabitsFirst
