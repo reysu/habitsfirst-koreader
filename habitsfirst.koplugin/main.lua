@@ -149,12 +149,22 @@ function HabitsFirst:_sync(manual)
     end
 
     local synced = self.settings:readSetting("synced") or {}
+    local synced_min = self.settings:readSetting("synced_min") or {}
     local sent, failed = 0, 0
     for day, info in pairs(daily) do
         if synced[day] ~= info.total then
             if self:post(token, channel, day, info) then
                 synced[day] = info.total
                 sent = sent + 1
+            else
+                failed = failed + 1
+            end
+        end
+        -- Sibling channel "<channel>.minutes": minutes-read goals in the
+        -- app read this; pages stay the primary value above.
+        if info.minutes and synced_min[day] ~= info.minutes then
+            if self:postValue(token, channel .. ".minutes", day, info.minutes) then
+                synced_min[day] = info.minutes
             else
                 failed = failed + 1
             end
@@ -166,6 +176,9 @@ function HabitsFirst:_sync(manual)
     for day in pairs(synced) do
         if day < cutoff then synced[day] = nil end
     end
+    for day in pairs(synced_min) do
+        if day < cutoff then synced_min[day] = nil end
+    end
 
     local result
     if failed > 0 then
@@ -176,6 +189,7 @@ function HabitsFirst:_sync(manual)
         result = _("up to date")
     end
     self.settings:saveSetting("synced", synced)
+    self.settings:saveSetting("synced_min", synced_min)
     self.settings:saveSetting("last_result", os.date("%m-%d %H:%M ") .. result)
     self.settings:flush()
     logger.info("habitsfirst:", result)
@@ -207,17 +221,24 @@ function HabitsFirst:getDailyPages(days)
     local out = {}
     for i = 1, #res[1] do
         local day = tostring(res[1][i])
-        local entry = out[day] or { total = 0, books = {} }
+        local entry = out[day] or { total = 0, minutes = 0, books = {} }
         local pages = tonumber(res[3][i]) or 0
+        local mins = math.floor((tonumber(res[4][i]) or 0) / 60 + 0.5)
         entry.total = entry.total + pages
+        entry.minutes = entry.minutes + mins
         table.insert(entry.books, {
             title = tostring(res[2][i]),
             pages = pages,
-            minutes = math.floor((tonumber(res[4][i]) or 0) / 60 + 0.5),
+            minutes = mins,
         })
         out[day] = entry
     end
     return out
+end
+
+-- Post a bare number to a channel (no books meta) — the minutes sibling.
+function HabitsFirst:postValue(token, channel, day, value)
+    return self:post(token, channel, day, { total = value, books = {} })
 end
 
 local function jsonEscape(s)
