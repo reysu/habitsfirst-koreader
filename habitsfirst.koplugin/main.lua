@@ -12,12 +12,16 @@ Pairing: on first run the plugin generates its own hf_ token, posts
 {code, token} to the hf_pairings handshake table, and shows a 6-digit
 code (popup + Tools → Habits First sync). Entering the code in the app
 adopts the token — nothing to type on the reader, no files to edit.
-Power users can still hand-set settings/habitsfirst.lua:
+Pairing is only offered for tokens the plugin minted itself: a token it
+did not mint (hand-written settings, an installer that provisioned one)
+is treated as already paired. Hand-set settings/habitsfirst.lua:
     return { token = "hf_...", channel = "koreader", window = 21 }
 (A legacy settings/habitdesu.lua with an hf_ token also works.)
 
 Sync triggers: KOReader start (~15s), closing a book (+5s), suspend,
-network reconnect, and Tools → Habits First sync → Sync now.
+network reconnect, page turns (throttled to one sync per ~25s, with a
+statistics flush first so the page just turned is included), and
+Tools → Habits First sync → Sync now.
 All work is wrapped in pcall — a failure can never interrupt reading.
 ]]
 
@@ -79,7 +83,11 @@ function HabitsFirst:init()
     if (self.settings:readSetting("token") or "") == "" then
         -- First run: mint the token now; reports start piling up under it
         -- immediately and history is already there when the app pairs.
+        -- "minted" marks the token as OURS: only minted tokens ever offer
+        -- pairing. A token we did not mint (hand-written settings, an
+        -- installer that provisioned one) is already known to an app.
         self.settings:saveSetting("token", "hf_" .. randomHex(16))
+        self.settings:saveSetting("minted", true)
         self.settings:flush()
     end
     UIManager:scheduleIn(15, function()
@@ -89,8 +97,10 @@ function HabitsFirst:init()
 end
 
 -- Paired = the app claimed our row (it deletes the row on claim). Until
--- then we keep a live code posted. "paired" survives restarts.
+-- then we keep a live code posted. "paired" survives restarts. Tokens we
+-- did not mint never pair: whoever wrote them already has them.
 function HabitsFirst:needsPairing()
+    if not self.settings:readSetting("minted") then return false end
     return not self.settings:readSetting("paired")
 end
 
@@ -234,6 +244,33 @@ end
 function HabitsFirst:autoSync()
     if os.time() - last_auto_sync < 300 then return end
     self:sync(false)
+end
+
+-- Near-live page counts (card d0e8dcaa): a page turn schedules a sync
+-- ~25s out, throttled to one pending timer at a time, skipping the
+-- 5-minute autoSync limit. The statistics plugin is flushed first so
+-- the page just turned is already in the DB when we read it.
+local PAGE_SYNC_DELAY = 25
+
+function HabitsFirst:onPageUpdate()
+    if self.page_sync_pending then return end
+    self.page_sync_pending = true
+    UIManager:scheduleIn(PAGE_SYNC_DELAY, function()
+        self.page_sync_pending = nil
+        self:flushStatistics()
+        self:sync(false)
+    end)
+end
+
+-- Ask the statistics plugin to write its in-memory page data to the DB.
+-- pcall absorbs signature drift across KOReader versions: if the flush
+-- fails we just sync numbers that are a page or two stale.
+function HabitsFirst:flushStatistics()
+    local ok, err = pcall(function()
+        local st = self.ui and self.ui.statistics
+        if st and st.insertDB then st:insertDB() end
+    end)
+    if not ok then logger.dbg("habitsfirst: stats flush failed", err) end
 end
 
 function HabitsFirst:sync(manual)
