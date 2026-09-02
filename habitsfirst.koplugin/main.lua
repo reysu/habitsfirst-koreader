@@ -209,6 +209,24 @@ function HabitsFirst:addToMainMenu(menu_items)
                 end,
             },
             {
+                -- Forget the pairing, mint a fresh token and offer its code
+                -- straight away. Replacing the plugin folder never touches
+                -- the settings file, so a reader stayed paired to a token no
+                -- phone held any more and there was no way out but deleting
+                -- the file by hand (Eric, 09-02).
+                text = _("Unpair"),
+                enabled_func = function() return not self:needsPairing() end,
+                callback = function()
+                    for _i, k in ipairs({ "paired", "pair_code", "pair_at", "last_result" }) do
+                        self.settings:delSetting(k)
+                    end
+                    self.settings:saveSetting("token", "hf_" .. randomHex(16))
+                    self.settings:saveSetting("minted", true)
+                    self.settings:flush()
+                    self:offerPairing(true)
+                end,
+            },
+            {
                 text_func = function()
                     local token = self.settings:readSetting("token") or ""
                     local channel = self.settings:readSetting("channel") or "koreader"
