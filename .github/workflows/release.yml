@@ -1,0 +1,30 @@
+# Every push to master whose _meta.lua version has no release yet gets
+# one: the plugin folder zipped as habitsfirst.koplugin.zip under tag
+# v<version>. habitsfirst.com/koreader/habitsfirst.koplugin.zip redirects
+# to the latest release asset, and the plugin's own update check reads
+# the latest tag, so bumping the version in _meta.lua is the release.
+name: Release
+on:
+  push:
+    branches: [master]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read version
+        id: v
+        run: echo "version=$(grep -oE 'version = "[^"]+"' habitsfirst.koplugin/_meta.lua | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Release if new
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          test -n "$V"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            echo "v$V already released"; exit 0
+          fi
+          zip -r habitsfirst.koplugin.zip habitsfirst.koplugin
+          gh release create "v$V" habitsfirst.koplugin.zip --title "v$V" --notes "$(git log -1 --pretty=%s)"

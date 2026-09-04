@@ -6,7 +6,7 @@ day) and upserts changed days into the Habits First inbox:
 
     POST /rest/v1/hf_reports   (x-hf-token: hf_...)
     [{"token":"hf_...","channel":"koreader","day":"YYYY-MM-DD","value":N,
-      "meta":{"source":"koreader","books":[{title,pages,minutes},...]}}]
+      "meta":{"source":"koreader","plugin":"1.1.0","books":[{title,pages,minutes},...]}}]
 
 Pairing: on first run the plugin generates its own hf_ token, posts
 {code, token} to the hf_pairings handshake table, and shows a 6-digit
@@ -35,6 +35,14 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local logger = require("logger")
 local ltn12 = require("ltn12")
 local _ = require("gettext")
+
+-- Where updates come from: the public repo's latest release. The
+-- files are fetched by tag from raw.githubusercontent.com and dropped
+-- over this folder; KOReader loads them on its next start.
+local HF_REPO = "reysu/habitsfirst-koreader"
+local HF_RELEASE_API = "https://api.github.com/repos/" .. HF_REPO .. "/releases/latest"
+local HF_RAW = "https://raw.githubusercontent.com/" .. HF_REPO .. "/"
+local PLUGIN_FILES = { "main.lua", "_meta.lua" }
 
 local HF_ENDPOINT = "https://xqkgklfcxrlmjgghgzji.supabase.co/rest/v1/hf_reports"
 local HF_PAIRINGS = "https://xqkgklfcxrlmjgghgzji.supabase.co/rest/v1/hf_pairings"
@@ -70,6 +78,14 @@ local HabitsFirst = WidgetContainer:extend{
 function HabitsFirst:init()
     local dir = DataStorage:getSettingsDir()
     self.settings = LuaSettings:open(dir .. "/habitsfirst.lua")
+    -- The version lives in _meta.lua only (the release workflow reads it
+    -- from there too); it shows in the menu so a bug report can name it.
+    self.plugin_dir = self.path or (DataStorage:getDataDir() .. "/plugins/habitsfirst.koplugin")
+    self.version = "?"
+    local ok_meta, meta = pcall(dofile, self.plugin_dir .. "/_meta.lua")
+    if ok_meta and type(meta) == "table" and meta.version then
+        self.version = tostring(meta.version)
+    end
     if (self.settings:readSetting("token") or "") == "" then
         -- Legacy install: the settings file kept its old name.
         local legacy = LuaSettings:open(dir .. "/habitdesu.lua")
@@ -234,13 +250,160 @@ function HabitsFirst:addToMainMenu(menu_items)
                     if token == "" then
                         return _("Status: no token configured")
                     end
-                    return string.format("%s → %s", channel, last)
+                    return string.format("v%s · %s → %s", self.version, channel, last)
                 end,
                 keep_menu_open = true,
                 callback = function() end,
             },
+            {
+                -- copy-pending
+                text_func = function()
+                    return string.format(_("Check for updates (v%s)"), self.version)
+                end,
+                keep_menu_open = true,
+                callback = function()
+                    self:checkForUpdates(true)
+                end,
+            },
+            {
+                -- copy-pending
+                text = _("Update automatically"),
+                checked_func = function()
+                    return self.settings:readSetting("auto_update") ~= false
+                end,
+                callback = function()
+                    local on = self.settings:readSetting("auto_update") ~= false
+                    self.settings:saveSetting("auto_update", not on)
+                    self.settings:flush()
+                end,
+            },
         },
     }
+end
+
+-- MARK: Updates
+
+local function httpGet(url, headers)
+    local sink = {}
+    local requester = require("ssl.https")
+    local has_su, socketutil = pcall(require, "socketutil")
+    if has_su then socketutil:set_timeout(10, 30) end
+    local ok, code = pcall(function()
+        local _res, c = requester.request{
+            url = url,
+            method = "GET",
+            headers = headers,
+            sink = ltn12.sink.table(sink),
+        }
+        return c
+    end)
+    if has_su then pcall(function() socketutil:reset_timeout() end) end
+    if not ok or code ~= 200 then return nil, code end
+    return table.concat(sink), code
+end
+
+-- "1.2.10" > "1.2.9": numeric per segment, missing segments read as 0.
+local function isNewer(candidate, current)
+    local a, b = {}, {}
+    for n in tostring(candidate):gmatch("%d+") do a[#a + 1] = tonumber(n) end
+    for n in tostring(current):gmatch("%d+") do b[#b + 1] = tonumber(n) end
+    if #a == 0 then return false end
+    for i = 1, math.max(#a, #b) do
+        local x, y = a[i] or 0, b[i] or 0
+        if x ~= y then return x > y end
+    end
+    return false
+end
+
+-- Latest release tag on GitHub, without the leading "v"; nil offline or
+-- when the API answers anything but a release.
+function HabitsFirst:latestVersion()
+    local body = httpGet(HF_RELEASE_API, {
+        ["User-Agent"] = "habitsfirst-koplugin/" .. self.version,
+        ["Accept"] = "application/vnd.github+json",
+    })
+    if not body then return nil end
+    return body:match('"tag_name"%s*:%s*"v?([%d%.]+)"')
+end
+
+-- Fetch every plugin file at the tag, check that main.lua at least
+-- compiles, then swap them in. A half-fetched update never replaces a
+-- working plugin: files land as .new first and rename only once all of
+-- them are on disk.
+function HabitsFirst:installVersion(version)
+    local fetched = {}
+    for _i, name in ipairs(PLUGIN_FILES) do
+        local body = httpGet(HF_RAW .. "v" .. version .. "/habitsfirst.koplugin/" .. name, {
+            ["User-Agent"] = "habitsfirst-koplugin/" .. self.version,
+        })
+        if not body or #body == 0 then return false, name end
+        if name:match("%.lua$") then
+            local compile = loadstring or load
+            if not compile(body, "=" .. name) then return false, name end
+        end
+        fetched[name] = body
+    end
+    for name, body in pairs(fetched) do
+        local f = io.open(self.plugin_dir .. "/" .. name .. ".new", "w")
+        if not f then return false, name end
+        f:write(body)
+        f:close()
+    end
+    for name in pairs(fetched) do
+        local ok = os.rename(self.plugin_dir .. "/" .. name .. ".new", self.plugin_dir .. "/" .. name)
+        if not ok then return false, name end
+    end
+    return true
+end
+
+-- Manual: always reports. Automatic (autoSync, once a day): silent
+-- unless an update actually landed, when it asks for the restart.
+function HabitsFirst:checkForUpdates(manual)
+    if not NetworkMgr:isConnected() then
+        if manual then
+            UIManager:show(InfoMessage:new{ text = _("Not connected to a network.") })
+        end
+        return
+    end
+    local latest = self:latestVersion()
+    if not latest then
+        if manual then
+            -- copy-pending
+            UIManager:show(InfoMessage:new{ text = _("Could not check for updates.") })
+        end
+        return
+    end
+    if not isNewer(latest, self.version) then
+        if manual then
+            -- copy-pending
+            UIManager:show(InfoMessage:new{ text = string.format(_("Up to date (v%s)."), self.version) })
+        end
+        return
+    end
+    local ok, failed = self:installVersion(latest)
+    if not ok then
+        logger.warn("habitsfirst: update to", latest, "failed at", failed)
+        if manual then
+            -- copy-pending
+            UIManager:show(InfoMessage:new{ text = string.format(_("Could not download v%s."), latest) })
+        end
+        return
+    end
+    logger.info("habitsfirst: updated to", latest)
+    -- copy-pending
+    UIManager:show(InfoMessage:new{
+        text = string.format(_("Updated to v%s. Restart KOReader to finish."), latest),
+    })
+end
+
+function HabitsFirst:autoUpdateCheck()
+    if self.settings:readSetting("auto_update") == false then return end
+    local today = os.date("%Y-%m-%d")
+    if self.settings:readSetting("update_checked") == today then return end
+    self.settings:saveSetting("update_checked", today)
+    self.settings:flush()
+    local ok, err = pcall(function() self:checkForUpdates(false) end)
+    if not ok then logger.warn("habitsfirst: update check failed", err) end
 end
 
 function HabitsFirst:onCloseDocument()
@@ -262,6 +425,7 @@ end
 function HabitsFirst:autoSync()
     if os.time() - last_auto_sync < 300 then return end
     self:sync(false)
+    self:autoUpdateCheck()
 end
 
 -- Near-live page counts (card d0e8dcaa): a page turn schedules a sync
@@ -453,8 +617,8 @@ function HabitsFirst:post(token, channel, day, info)
             jsonEscape(b.title), b.pages, jsonNumber(b.minutes)))
     end
     local body = string.format(
-        '[{"token":"%s","channel":"%s","day":"%s","value":%s,"meta":{"source":"koreader","books":[%s]}}]',
-        token, jsonEscape(channel), day, jsonNumber(info.total), table.concat(books, ","))
+        '[{"token":"%s","channel":"%s","day":"%s","value":%s,"meta":{"source":"koreader","plugin":"%s","books":[%s]}}]',
+        token, jsonEscape(channel), day, jsonNumber(info.total), jsonEscape(self.version or "?"), table.concat(books, ","))
     local sink = {}
     local requester = require("ssl.https")
     local has_su, socketutil = pcall(require, "socketutil")
