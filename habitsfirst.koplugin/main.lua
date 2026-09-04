@@ -402,20 +402,28 @@ function HabitsFirst:getDailyPages(days)
     local res_ok, res = pcall(function() return conn:exec(sql) end)
     pcall(function() conn:close() end)
     if not res_ok or not res then return {} end
+    -- Seconds are summed first and turned into minutes ONCE, to a tenth:
+    -- rounding each book to a whole minute and adding those up reported
+    -- three 25-second reads as 0 minutes (Eric, 09-04).
+    local function tenths(secs) return math.floor(secs / 6 + 0.5) / 10 end
     local out = {}
     for i = 1, #res[1] do
         local day = tostring(res[1][i])
-        local entry = out[day] or { total = 0, minutes = 0, books = {} }
+        local entry = out[day] or { total = 0, secs = 0, books = {} }
         local pages = tonumber(res[3][i]) or 0
-        local mins = math.floor((tonumber(res[4][i]) or 0) / 60 + 0.5)
+        local secs = tonumber(res[4][i]) or 0
         entry.total = entry.total + pages
-        entry.minutes = entry.minutes + mins
+        entry.secs = entry.secs + secs
         table.insert(entry.books, {
             title = tostring(res[2][i]),
             pages = pages,
-            minutes = mins,
+            minutes = tenths(secs),
         })
         out[day] = entry
+    end
+    for _, entry in pairs(out) do
+        entry.minutes = tenths(entry.secs)
+        entry.secs = nil
     end
     return out
 end
@@ -429,17 +437,24 @@ local function jsonEscape(s)
     return s:gsub('[\\"]', '\\%0'):gsub("[%c]", " ")
 end
 
+-- Whole numbers stay bare ("37"), tenths keep one decimal ("68.4"): the
+-- pages value is an integer and the minutes value may not be.
+local function jsonNumber(x)
+    if x == math.floor(x) then return string.format("%d", x) end
+    return string.format("%.1f", x)
+end
+
 function HabitsFirst:post(token, channel, day, info)
     -- meta lets clients render "Book title — 35 pages" when a day is tapped
     local books = {}
     for _, b in ipairs(info.books) do
         table.insert(books, string.format(
-            '{"title":"%s","pages":%d,"minutes":%d}',
-            jsonEscape(b.title), b.pages, b.minutes))
+            '{"title":"%s","pages":%d,"minutes":%s}',
+            jsonEscape(b.title), b.pages, jsonNumber(b.minutes)))
     end
     local body = string.format(
-        '[{"token":"%s","channel":"%s","day":"%s","value":%d,"meta":{"source":"koreader","books":[%s]}}]',
-        token, jsonEscape(channel), day, info.total, table.concat(books, ","))
+        '[{"token":"%s","channel":"%s","day":"%s","value":%s,"meta":{"source":"koreader","books":[%s]}}]',
+        token, jsonEscape(channel), day, jsonNumber(info.total), table.concat(books, ","))
     local sink = {}
     local requester = require("ssl.https")
     local has_su, socketutil = pcall(require, "socketutil")
