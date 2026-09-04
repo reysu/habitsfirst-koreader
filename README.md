@@ -25,3 +25,7 @@ Every network call is wrapped in `pcall` — a sync failure can never interrupt 
 ## Privacy
 
 The plugin sends: date, pages turned, minutes read, and book titles (so the app can show "35 pages — Book title"). Nothing else leaves the device. Rows are stored keyed by your random token; without the token they are unreadable.
+
+## Updates
+
+**Tools → Habits First sync** shows the installed version and has **Check for updates**. With **Update automatically** on (the default) the plugin checks once a day after a sync, installs a newer release over itself, and asks you to restart KOReader. Releases are published from this repo: bumping `version` in `habitsfirst.koplugin/_meta.lua` on master creates the tag and the zip, and `habitsfirst.com/koreader/habitsfirst.koplugin.zip` always points at the latest one.
