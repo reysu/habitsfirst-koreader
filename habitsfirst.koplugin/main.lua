@@ -467,6 +467,24 @@ function HabitsFirst:sync(manual)
     end
 end
 
+-- The app's day. The phone publishes its "New day starts at" hour as a
+-- marker row (channel "_") under this token; pages turned before that
+-- hour belong to the previous day there, so they must here too, or a
+-- read after midnight lands on tomorrow and the block never sees it
+-- (Eric, 10-11). nil when the marker cannot be fetched; 0 when there is
+-- no marker yet (an app that predates it): midnight, as before.
+function HabitsFirst:fetchRollover(token)
+    local body = httpGet(HF_ENDPOINT .. "?select=meta&token=eq." .. token .. "&channel=eq._&limit=1", {
+        ["apikey"] = HF_ANON,
+        ["Authorization"] = "Bearer " .. HF_ANON,
+        ["x-hf-token"] = token,
+    })
+    if not body then return nil end
+    local n = tonumber(body:match('"rollover"%s*:%s*(%d+)'))
+    if n and n >= 0 and n <= 23 then return n end
+    return 0
+end
+
 function HabitsFirst:_sync(manual)
     local token = self.settings:readSetting("token") or ""
     local channel = self.settings:readSetting("channel") or "koreader"
@@ -486,7 +504,14 @@ function HabitsFirst:_sync(manual)
 
     last_auto_sync = os.time()
 
-    local daily = self:getDailyPages(window)
+    local rollover = self:fetchRollover(token)
+    if rollover then
+        self.settings:saveSetting("rollover", rollover)
+    else
+        rollover = self.settings:readSetting("rollover") or 0
+    end
+
+    local daily = self:getDailyPages(window, rollover)
     if daily == nil then
         if manual then
             UIManager:show(InfoMessage:new{ text = _("Could not read reading statistics.") })
@@ -548,21 +573,25 @@ end
 
 -- per-day, per-book pages for the last `days` days:
 -- { ["2026-07-03"] = { total = 38, books = { {title=..., pages=..., minutes=...}, ... } } }
-function HabitsFirst:getDailyPages(days)
+function HabitsFirst:getDailyPages(days, rollover)
+    -- Shift every page back by the app's rollover hour before taking the
+    -- date, so 01:30 on the 11th counts for the 10th when the day starts
+    -- at 4 (the same rule the apps and the webhook handler apply).
+    local shift = (tonumber(rollover) or 0) * 3600
     local db_path = DataStorage:getSettingsDir() .. "/statistics.sqlite3"
     local ok, conn = pcall(SQ3.open, db_path, "ro")
     if not ok or not conn then return nil end
     local sql = string.format([[
-        SELECT date(ps.start_time, 'unixepoch', 'localtime') AS day,
+        SELECT date(ps.start_time - %d, 'unixepoch', 'localtime') AS day,
                b.title AS title,
                count(DISTINCT ps.page) AS pages,
                sum(ps.duration) AS secs
         FROM page_stat ps
         JOIN book b ON b.id = ps.id_book
-        WHERE ps.start_time >= strftime('%%s', 'now', '-%d days')
+        WHERE ps.start_time >= CAST(strftime('%%s', 'now', '-%d days') AS INTEGER) + %d
         GROUP BY day, b.id
         ORDER BY day, pages DESC;
-    ]], days)
+    ]], shift, days, shift)
     local res_ok, res = pcall(function() return conn:exec(sql) end)
     pcall(function() conn:close() end)
     if not res_ok or not res then return {} end
